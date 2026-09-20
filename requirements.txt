@@ -1,0 +1,5 @@
+langgraph>=0.6
+langchain-groq>=0.3
+langchain-core>=0.3
+neo4j>=5.28
+python-dotenv>=1.0

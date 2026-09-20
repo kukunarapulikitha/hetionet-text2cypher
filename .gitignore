@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+.schema_cache.json
+eval_results*.json
+.DS_Store
