@@ -123,6 +123,10 @@ def score(record: dict, run: AgentRun, case: EvalCase, judge) -> dict:
                 "groundedness": judgment.groundedness,
                 "relevance": judgment.relevance,
                 "expectation_met": judgment.expectation_met,
+                # Carried as its own score rather than only as a comment:
+                # Langfuse Cloud drops score comments on the current ingestion
+                # path, so the reasoning would otherwise be invisible in the UI.
+                "judge_reasoning": judgment.reasoning[:480],
             },
             comment=judgment.reasoning,
         )
