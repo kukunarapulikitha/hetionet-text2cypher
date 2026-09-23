@@ -46,6 +46,78 @@ python evaluate.py                              # run + score the 21-question ev
 python evaluate.py --only simple --no-judge     # cheap subset, rule-based metrics only
 ```
 
+## Architecture
+
+```mermaid
+flowchart LR
+    User(["User"])
+
+    subgraph Entry["Entry points"]
+        CLI["main.py<br/>CLI / REPL"]
+        EVAL["evaluate.py<br/>21-question eval set"]
+    end
+
+    subgraph Agent["agent.py — LCEL chain"]
+        PROMPT["ChatPromptTemplate<br/>schema + few-shot examples<br/>(examples.py)"]
+        REACT["create_react_agent<br/>ChatGroq · MAX_QUERIES budget"]
+        MEM[("InMemorySaver<br/>per-thread memory")]
+        TOOL["run_cypher @tool"]
+        STRIP["StrOutputParser<br/>+ strip &lt;think&gt;"]
+    end
+
+    subgraph Guard["Guardrails"]
+        VAL["validate.py<br/>clause blocklist<br/>procedure allowlist"]
+        GRAPH["graph.py — HetionetGraph<br/>read-only session · 10s timeout<br/>25-row cap"]
+        CACHE[(".schema_cache.json")]
+    end
+
+    NEO4J[("Neo4j — Hetionet<br/>bolt://neo4j.het.io:7687")]
+    GROQ["Groq API<br/>agent model"]
+
+    subgraph Scoring["Evaluation"]
+        METRICS["metrics.py<br/>deterministic signals<br/>gold expectations · cross_check"]
+        JUDGE["judge.py<br/>LLM judge (different model)<br/>groundedness · relevance"]
+    end
+
+    LF["Langfuse<br/>traces + scores<br/>(optional, observability.py)"]
+    CFG["config.py<br/>.env settings"]
+
+    User --> CLI
+    CLI --> PROMPT
+    EVAL --> PROMPT
+    PROMPT --> REACT
+    REACT <--> MEM
+    REACT <-->|LLM calls| GROQ
+    REACT -->|Cypher| TOOL
+    TOOL -->|rows / REJECTED / errors as text| REACT
+    TOOL --> VAL --> GRAPH --> NEO4J
+    GRAPH -. schema introspection .-> CACHE
+    CACHE -. schema .-> PROMPT
+    REACT --> STRIP -->|answer| CLI
+    STRIP --> EVAL
+    EVAL --> METRICS
+    EVAL --> JUDGE
+    JUDGE <--> GROQ
+    REACT -. callbacks .-> LF
+    METRICS -. scores .-> LF
+    JUDGE -. scores .-> LF
+    CFG -.-> Agent
+    CFG -.-> Guard
+```
+
+1. **Startup** — `graph.py` introspects the Neo4j schema (cached to `.schema_cache.json`)
+   and it is baked into the system prompt alongside the few-shot examples.
+2. **Question loop** — the ReAct agent calls ChatGroq, writes Cypher, and invokes
+   `run_cypher`. Every query passes `validate.py`, then runs in a read-only Bolt
+   session with a timeout and row cap. Rows (or errors) go back to the model, which
+   either answers or queries again, up to `MAX_QUERIES`.
+3. **Answer** — the final message is parsed, `<think>` blocks are stripped, and the
+   plain-English answer is returned to the CLI.
+4. **Evaluation** — `evaluate.py` scores each run with rule-based metrics, gold
+   expectations and an LLM judge on a separate model.
+5. **Observability** — when Langfuse keys are set, every LLM and tool call is traced
+   and eval scores are attached to the same trace; otherwise it is a no-op.
+
 ## How it works
 
 ```
@@ -126,7 +198,8 @@ before concluding the graph has no answer.
 | `observability.py` | Langfuse tracing. Every function is a no-op when the keys are unset. |
 | `judge.py` | The LLM judge: `Judgment` schema, per-category rubrics, structured-output chain. |
 | `metrics.py` | Rule-based signals, gold `Expectation` checks, and the summary table. |
-| `evaluate.py` | 21-question eval set across 5 categories, scored three ways. |
+| `golden_dataset/` | The 21 questions as data: reference Cypher, reference answer and machine-checked expectations, all verified against the live graph. |
+| `evaluate.py` | Loads the golden dataset and scores every answer three ways. |
 | `test_offline.py` | 60 assertions covering validation, `<think>` stripping, the execution guardrails, the tracing callback, the metrics and the judge schema. Never calls the LLM, so it needs no Groq key and spends no tokens. |
 
 ### Why not `langchain_neo4j.Neo4jGraph` / `GraphCypherQAChain`?
@@ -239,21 +312,45 @@ rubber-stamp, surfaced as `SUSPECT` rather than quietly averaged in.
 Judgments are attached to the Langfuse trace as scores, so the table above and the
 timeline in the UI are the same data.
 
-### Gold expectations
+### The golden dataset
 
-Only a subset of questions carry one, because an expectation is only sound where
-the answer is stable. Results are capped at `MAX_ROWS`, so a question whose full
-result set exceeds the cap returns an arbitrary 25 of *N* rows — naming entities
-there would fail at random rather than on a regression. `epilepsy syndrome` has
-exactly 25 treating compounds, and the aggregates are ordered, so those qualify:
+[`golden_dataset/questions.json`](golden_dataset/questions.json) is the single source of
+truth for what the agent is tested on. Every entry carries the **reference Cypher** and
+the **reference answer**, obtained by running that query against the live graph — not
+written from memory:
 
-```python
-"How many diseases are in the graph?": Expectation(number=137),
-"Which 10 compounds treat the most diseases?": Expectation(entities=["Methotrexate"]),
+```json
+{
+  "question": "How many diseases are in the graph?",
+  "reference_cypher": "MATCH (d:Disease) RETURN count(d) AS n",
+  "reference_answer": "There are 137 diseases in Hetionet.",
+  "expected": { "number": 137 }
+}
 ```
 
-Every `no-answer` question carries `Expectation(decline=True)` instead — a
-zero-token regex check that the answer actually reports finding nothing.
+The reference answer goes into the judge prompt, and it closes the hole groundedness
+cannot see. A wrong query that returns *real* rows produces an answer that is perfectly
+faithful to those rows:
+
+```
+question  : How many diseases are in the graph?
+cypher    : MATCH (d:Disease)-[:TREATS_CtD]-(c) RETURN count(DISTINCT d)   ← wrong
+rows      : [{"n": 77}]
+answer    : The graph contains 77 diseases.
+judged    : grounded 5/5   ← correct! the answer IS faithful to the row
+            expected NO    ← caught only because the reference says 137
+```
+
+`expected` is the machine-checked part — zero tokens, no LLM. Only 10 of 21 questions
+carry one, because an expectation is only sound where the answer is stable: results are
+capped at `MAX_ROWS`, so a question whose full result set exceeds the cap returns an
+arbitrary 25 of *N* rows, and naming entities there would fail at random rather than on a
+regression. `epilepsy syndrome` has exactly 25 treating compounds and the aggregates are
+ordered, so those qualify; Crohn's disease (120 genes) does not. An offline test enforces
+this rule so the dataset can't drift into flakiness.
+
+Every `no-answer` question carries `{"decline": true}` instead — a regex check that the
+answer actually reports finding nothing.
 
 One eval question is *mis-categorised* by intent, not by accident: "What drugs
 treat heart attack?" sits under `no-answer` rather than `ambiguous`, because

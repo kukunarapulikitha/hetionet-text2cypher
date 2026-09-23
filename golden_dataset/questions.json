@@ -1,0 +1,162 @@
+{
+  "description": "Hetionet text2cypher golden dataset. 21 questions across 5 categories. reference_cypher and reference_answer were obtained by running the query against bolt://neo4j.het.io:7687 on 2026-09-23, not written from memory. 'expected' holds the machine-checked assertions. See README.md.",
+  "questions": [
+    {
+      "category": "simple",
+      "question": "What compounds treat epilepsy syndrome?",
+      "reference_cypher": "MATCH (c:Compound)-[:TREATS_CtD]->(d:Disease) WHERE toLower(d.name) CONTAINS 'epilepsy' RETURN c.name AS compound",
+      "reference_answer": "25 compounds treat epilepsy syndrome, including Acetazolamide, Amobarbital, Carbamazepine, Clobazam and Clonazepam.",
+      "total_results": 25,
+      "expected": { "entities": ["Clonazepam", "Carbamazepine"] }
+    },
+    {
+      "category": "simple",
+      "question": "Which genes are associated with Crohn's disease?",
+      "reference_cypher": "MATCH (d:Disease)-[:ASSOCIATES_DaG]->(g:Gene) WHERE toLower(d.name) CONTAINS \"crohn\" RETURN g.name AS gene",
+      "reference_answer": "120 genes are associated with Crohn's disease, including ACKR2, ADAM30, ALB and ANKRD55. The agent sees only 25 of these because of the row cap, so it should hedge rather than state a total.",
+      "total_results": 120
+    },
+    {
+      "category": "simple",
+      "question": "What symptoms does asthma present?",
+      "reference_cypher": "MATCH (d:Disease)-[:PRESENTS_DpS]->(s:Symptom) WHERE toLower(d.name) = 'asthma' RETURN s.name AS symptom",
+      "reference_answer": "Asthma presents 26 symptoms, including Alkalosis (Respiratory), Anoxia, Apnea and Cough.",
+      "total_results": 26
+    },
+    {
+      "category": "simple",
+      "question": "What side effects does Metformin cause?",
+      "reference_cypher": "MATCH (c:Compound)-[:CAUSES_CcSE]->(s:SideEffect) WHERE toLower(c.name) = 'metformin' RETURN s.name AS side_effect",
+      "reference_answer": "Metformin causes 139 recorded side effects, including Abdominal bloating, Abdominal discomfort, Abdominal distension and Abdominal pain.",
+      "total_results": 139
+    },
+    {
+      "category": "simple",
+      "question": "Which anatomies express the gene BRCA1?",
+      "reference_cypher": "MATCH (a:Anatomy)-[:EXPRESSES_AeG]->(g:Gene) WHERE g.name = 'BRCA1' RETURN a.name AS anatomy",
+      "reference_answer": "34 anatomies express BRCA1, including adipose tissue, adrenal gland, blood and bone marrow.",
+      "total_results": 34
+    },
+
+    {
+      "category": "multi-hop",
+      "question": "Which compounds bind genes associated with multiple sclerosis?",
+      "reference_cypher": "MATCH (d:Disease)-[:ASSOCIATES_DaG]->(g:Gene) WHERE toLower(d.name) = 'multiple sclerosis' MATCH (c:Compound)-[:BINDS_CbG]->(g) RETURN DISTINCT c.name AS compound",
+      "reference_answer": "262 compounds bind genes associated with multiple sclerosis, including Abiraterone, Acenocoumarol and Acepromazine.",
+      "total_results": 262
+    },
+    {
+      "category": "multi-hop",
+      "question": "What pathways do genes associated with type 2 diabetes participate in?",
+      "reference_cypher": "MATCH (d:Disease)-[:ASSOCIATES_DaG]->(g:Gene) WHERE toLower(d.name) CONTAINS 'type 2 diabetes' MATCH (g)-[:PARTICIPATES_GpPW]->(p:Pathway) RETURN DISTINCT p.name AS pathway",
+      "reference_answer": "The 275 genes associated with type 2 diabetes mellitus participate in 1092 distinct pathways, including 2-LTR circle formation and ABC-family proteins mediated transport.",
+      "total_results": 1092
+    },
+    {
+      "category": "multi-hop",
+      "question": "Which diseases share genes with breast cancer?",
+      "reference_cypher": "MATCH (d1:Disease)-[:ASSOCIATES_DaG]->(g:Gene)<-[:ASSOCIATES_DaG]-(d2:Disease) WHERE toLower(d1.name) = 'breast cancer' AND d1 <> d2 RETURN d2.name AS disease, count(g) AS shared ORDER BY shared DESC",
+      "reference_answer": "121 diseases share at least one gene with breast cancer. Prostate cancer shares the most (137 genes), followed by hematologic cancer (121), lung cancer (97) and melanoma (91).",
+      "total_results": 121
+    },
+    {
+      "category": "multi-hop",
+      "question": "What side effects are caused by compounds that treat hypertension?",
+      "reference_cypher": "MATCH (c:Compound)-[:TREATS_CtD]->(d:Disease) WHERE toLower(d.name) CONTAINS 'hypertension' MATCH (c)-[:CAUSES_CcSE]->(s:SideEffect) RETURN s.name AS side_effect, count(DISTINCT c) AS compounds ORDER BY compounds DESC",
+      "reference_answer": "1319 distinct side effects are caused by the 68 compounds that treat hypertension. The most common are Nausea (63 compounds), Dizziness (62) and Diarrhoea (61).",
+      "total_results": 1319
+    },
+    {
+      "category": "multi-hop",
+      "question": "Which pharmacologic classes include compounds that treat asthma?",
+      "reference_cypher": "MATCH (c:Compound)-[:TREATS_CtD]->(d:Disease) WHERE toLower(d.name) = 'asthma' MATCH (c)-[:INCLUDES_PCiC]-(p:PharmacologicClass) RETURN DISTINCT p.name AS pharmacologic_class",
+      "reference_answer": "9 pharmacologic classes include compounds that treat asthma, among them 5-Lipoxygenase Inhibitors and Adrenergic beta2-Agonists.",
+      "total_results": 9,
+      "expected": { "entities": ["Adrenergic beta2-Agonists"] }
+    },
+
+    {
+      "category": "aggregate",
+      "question": "How many diseases are in the graph?",
+      "reference_cypher": "MATCH (d:Disease) RETURN count(d) AS n",
+      "reference_answer": "There are 137 diseases in Hetionet.",
+      "expected": { "number": 137 }
+    },
+    {
+      "category": "aggregate",
+      "question": "Which 10 compounds treat the most diseases?",
+      "reference_cypher": "MATCH (c:Compound)-[:TREATS_CtD]->(d:Disease) RETURN c.name AS compound, count(d) AS n ORDER BY n DESC LIMIT 10",
+      "reference_answer": "Methotrexate treats the most diseases (19), followed by Doxorubicin (17), Prednisone (15) and Epirubicin (14).",
+      "expected": { "entities": ["Methotrexate"] }
+    },
+    {
+      "category": "aggregate",
+      "question": "What are the five most common side effects across all compounds?",
+      "reference_cypher": "MATCH (c:Compound)-[:CAUSES_CcSE]->(s:SideEffect) RETURN s.name AS side_effect, count(c) AS n ORDER BY n DESC LIMIT 5",
+      "reference_answer": "Nausea (932 compounds), Headache (872), Dermatitis (866), Rash (865) and Vomiting (856).",
+      "expected": { "entities": ["Nausea", "Headache"] }
+    },
+
+    {
+      "category": "ambiguous",
+      "question": "What treats high blood pressure?",
+      "reference_cypher": "MATCH (c:Compound)-[:TREATS_CtD]->(d:Disease) WHERE toLower(d.name) CONTAINS 'hypertension' RETURN c.name AS compound",
+      "reference_answer": "\"High blood pressure\" is 'hypertension' in Hetionet. 68 compounds treat it, including Acebutolol, Amiloride and Amlodipine.",
+      "total_results": 68,
+      "note": "Resolving the colloquial term to 'hypertension' is the behaviour under test."
+    },
+    {
+      "category": "ambiguous",
+      "question": "Which genes are linked to sugar diabetes?",
+      "reference_cypher": "MATCH (d:Disease)-[:ASSOCIATES_DaG]->(g:Gene) WHERE toLower(d.name) CONTAINS 'diabetes' RETURN DISTINCT g.name AS gene",
+      "reference_answer": "\"Sugar diabetes\" maps to Hetionet's diabetes diseases: type 1 diabetes mellitus, type 2 diabetes mellitus and gestational diabetes. 379 distinct genes are associated with them (275 for type 2 alone). There is no plain 'diabetes mellitus' node.",
+      "total_results": 379
+    },
+    {
+      "category": "ambiguous",
+      "question": "What genes are associated with Lou Gehrig's disease?",
+      "reference_cypher": "MATCH (d:Disease)-[:ASSOCIATES_DaG]->(g:Gene) WHERE toLower(d.name) CONTAINS 'amyotrophic' RETURN g.name AS gene",
+      "reference_answer": "Lou Gehrig's disease is 'amyotrophic lateral sclerosis' in Hetionet, which has 114 associated genes including SOD1, C9orf72, TARDBP, FUS, ATXN2 and ALS2.",
+      "total_results": 114
+    },
+
+    {
+      "category": "no-answer",
+      "question": "What drugs treat heart attack?",
+      "reference_cypher": "MATCH (d:Disease) WHERE toLower(d.name) CONTAINS 'myocardial' OR toLower(d.name) CONTAINS 'infarction' RETURN d.name",
+      "reference_answer": "No answer. Hetionet has no myocardial infarction node at all — the search returns zero rows. The nearest concept is 'coronary artery disease', which is not the same condition. The agent should translate the term, find nothing, and say so.",
+      "total_results": 0,
+      "expected": { "decline": true }
+    },
+    {
+      "category": "no-answer",
+      "question": "What compounds treat Klingon lung fever?",
+      "reference_cypher": "MATCH (d:Disease) WHERE toLower(d.name) CONTAINS 'lung fever' RETURN d.name",
+      "reference_answer": "No answer. The disease is fictional and no such node exists.",
+      "total_results": 0,
+      "expected": { "decline": true }
+    },
+    {
+      "category": "no-answer",
+      "question": "Which genes are associated with unicorn deficiency syndrome?",
+      "reference_cypher": "MATCH (d:Disease) WHERE toLower(d.name) CONTAINS 'unicorn' RETURN d.name",
+      "reference_answer": "No answer. The disease is fictional and no such node exists.",
+      "total_results": 0,
+      "expected": { "decline": true }
+    },
+    {
+      "category": "no-answer",
+      "question": "What is the average cost of insulin in the United States?",
+      "reference_answer": "No answer. Hetionet models biomedical relationships and holds no pricing or economic data, so the question is out of scope for the graph regardless of phrasing.",
+      "total_results": 0,
+      "expected": { "decline": true }
+    },
+    {
+      "category": "no-answer",
+      "question": "Who discovered penicillin?",
+      "reference_answer": "No answer. Hetionet records no discovery or attribution data. This is the hardest case in the set: the model knows 'Alexander Fleming' from its own weights, and supplying it would be an ungrounded answer even though it is factually true.",
+      "total_results": 0,
+      "expected": { "decline": true }
+    }
+  ]
+}

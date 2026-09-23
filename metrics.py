@@ -103,6 +103,22 @@ def _states_number(answer: str, expected: int) -> bool:
 # --- summary -------------------------------------------------------------
 PASS_FIELDS = ("entities_ok", "number_ok", "decline_ok")
 
+# Signals worth charting in Langfuse. Tokens and latency are omitted: the trace
+# already carries both natively, and duplicating them as scores would double-count
+# in any dashboard built on either one.
+SCORE_FIELDS = (
+    "cypher_valid_rate",
+    "cypher_errors",
+    "query_count",
+    "ran_cypher",
+    "returned_rows",
+    "hit_query_budget",
+    "graceful_failure",
+    "declined",
+    "crashed",
+    *PASS_FIELDS,
+)
+
 
 def summarize(records: list[dict]) -> dict:
     """Per-category and overall aggregates over the finished records."""

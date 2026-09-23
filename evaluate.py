@@ -7,7 +7,7 @@ Each question produces three kinds of evidence:
   deterministic  rule-based signals off the run itself — did it run any Cypher,
                  how many queries, were any rejected (metrics.py)
   gold           hand-verified expectations, on the subset of questions where
-                 the right answer is stable (see EXPECTATIONS below)
+                 the right answer is stable (golden_dataset/)
   judge          an LLM scoring groundedness and relevance against the rows the
                  agent actually saw (judge.py)
 
@@ -23,7 +23,8 @@ import argparse
 import json
 import logging
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
+from pathlib import Path
 
 import config
 import metrics
@@ -34,79 +35,47 @@ from judge import build_judge, judge_run
 from metrics import Expectation
 
 
+GOLDEN_DATASET = Path(__file__).parent / "golden_dataset" / "questions.json"
+
+
 @dataclass(slots=True)
 class EvalCase:
     category: str
     question: str
     expected: Expectation | None = None
+    reference_answer: str | None = None
 
 
-# Verified against the live graph, and deliberately sparse: an expectation is
-# only sound where the answer is stable. Questions whose full result set
-# exceeds the MAX_ROWS cap return an arbitrary 25 of N rows, so naming entities
-# there would fail at random rather than on a regression. Only "epilepsy
-# syndrome" (exactly 25 compounds) and the ordered aggregates qualify.
-EXPECTATIONS = {
-    "What compounds treat epilepsy syndrome?": Expectation(
-        entities=["Clonazepam", "Carbamazepine"]
-    ),
-    "How many diseases are in the graph?": Expectation(number=137),
-    "Which 10 compounds treat the most diseases?": Expectation(entities=["Methotrexate"]),
-    "What are the five most common side effects across all compounds?": Expectation(
-        entities=["Nausea", "Headache"]
-    ),
-}
+def load_cases(path: Path = GOLDEN_DATASET) -> list[EvalCase]:
+    """Read the golden dataset.
 
-EVAL_QUESTIONS: list[EvalCase] = [
-    # -- simple 1-hop ----------------------------------------------------
-    EvalCase("simple", "What compounds treat epilepsy syndrome?"),
-    EvalCase("simple", "Which genes are associated with Crohn's disease?"),
-    EvalCase("simple", "What symptoms does asthma present?"),
-    EvalCase("simple", "What side effects does Metformin cause?"),
-    EvalCase("simple", "Which anatomies express the gene BRCA1?"),
-    # -- multi-hop -------------------------------------------------------
-    EvalCase("multi-hop", "Which compounds bind genes associated with multiple sclerosis?"),
-    EvalCase(
-        "multi-hop", "What pathways do genes associated with type 2 diabetes participate in?"
-    ),
-    EvalCase("multi-hop", "Which diseases share genes with breast cancer?"),
-    EvalCase("multi-hop", "What side effects are caused by compounds that treat hypertension?"),
-    EvalCase("multi-hop", "Which pharmacologic classes include compounds that treat asthma?"),
-    # -- aggregates ------------------------------------------------------
-    EvalCase("aggregate", "How many diseases are in the graph?"),
-    EvalCase("aggregate", "Which 10 compounds treat the most diseases?"),
-    EvalCase("aggregate", "What are the five most common side effects across all compounds?"),
-    # -- ambiguous entity naming ----------------------------------------
-    # The graph name differs from everyday usage, but the entity IS present:
-    # high blood pressure -> hypertension, sugar diabetes -> diabetes mellitus,
-    # Lou Gehrig's disease -> amyotrophic lateral sclerosis.
-    EvalCase("ambiguous", "What treats high blood pressure?"),
-    EvalCase("ambiguous", "Which genes are linked to sugar diabetes?"),
-    EvalCase("ambiguous", "What genes are associated with Lou Gehrig's disease?"),
-    # -- expected to have no answer in Hetionet -------------------------
-    # "heart attack" belongs here, not under ambiguous: Hetionet has no
-    # myocardial infarction node at all, only coronary artery disease. The
-    # right behaviour is to translate the term and then report no results.
-    EvalCase("no-answer", "What drugs treat heart attack?"),
-    EvalCase("no-answer", "What compounds treat Klingon lung fever?"),
-    EvalCase("no-answer", "Which genes are associated with unicorn deficiency syndrome?"),
-    EvalCase("no-answer", "What is the average cost of insulin in the United States?"),
-    EvalCase("no-answer", "Who discovered penicillin?"),
-]
+    The question set lives as data rather than Python literals so the graph
+    values it asserts can be diffed and re-verified independently of the runner.
+    See golden_dataset/README.md for how each entry was obtained.
+    """
+    raw = json.loads(path.read_text())["questions"]
+    return [
+        EvalCase(
+            category=entry["category"],
+            question=entry["question"],
+            expected=Expectation(**entry["expected"]) if entry.get("expected") else None,
+            reference_answer=entry.get("reference_answer"),
+        )
+        for entry in raw
+    ]
 
-# Every no-answer question must decline; applied here rather than repeated above.
-EVAL_QUESTIONS = [
-    replace(case, expected=EXPECTATIONS.get(case.question))
-    if case.category != "no-answer"
-    else replace(case, expected=Expectation(decline=True))
-    for case in EVAL_QUESTIONS
-]
+
+EVAL_QUESTIONS: list[EvalCase] = load_cases()
 
 
 def score(record: dict, run: AgentRun, case: EvalCase, judge) -> dict:
     """Attach deterministic signals, the judgment and Langfuse scores to a record."""
     signals = metrics.deterministic(run, case.expected)
-    judgment = judge_run(judge, run, case.category, case.expected) if judge else None
+    judgment = (
+        judge_run(judge, run, case.category, case.expected, case.reference_answer)
+        if judge
+        else None
+    )
 
     record |= {
         "metrics": signals,
@@ -130,10 +99,12 @@ def score(record: dict, run: AgentRun, case: EvalCase, judge) -> dict:
             },
             comment=judgment.reasoning,
         )
-    # Gold checks are worth recording even without a judge — they cost nothing.
+    # Rule-based signals are recorded even with --no-judge: they cost nothing and
+    # they are what makes Cypher validity and the judge watchdog chartable.
     observability.record_scores(
         run.trace_id,
-        {k: v for k, v in signals.items() if k in metrics.PASS_FIELDS},
+        {k: v for k, v in signals.items() if k in metrics.SCORE_FIELDS}
+        | {"suspect": record["suspect"]},
     )
     return record
 

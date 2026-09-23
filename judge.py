@@ -150,6 +150,7 @@ def judge_run(
     run: AgentRun,
     category: str,
     expected: Expectation | None = None,
+    reference_answer: str | None = None,
 ) -> Judgment | None:
     """Score one run. Returns None if the judge could not be parsed."""
     return judge.invoke(
@@ -160,8 +161,28 @@ def judge_run(
             "queries": _numbered(run.queries) or "(the agent ran no queries at all)",
             "results": _truncate(_numbered(run.results)) or "(no rows were returned)",
             "answer": run.answer or "(no answer produced)",
-            "expected": _expected_block(expected),
+            "expected": _reference_block(reference_answer) + _expected_block(expected),
         }
+    )
+
+
+def _reference_block(reference_answer: str | None) -> str:
+    """Give the judge the known-correct answer from the golden dataset.
+
+    Without it the judge can only check that the answer follows from the rows,
+    which a wrong query returning real rows satisfies perfectly. The cap caveat
+    matters: the agent legitimately sees 25 of N rows, so listing fewer items
+    than the reference is correct behaviour, not an error.
+    """
+    if not reference_answer:
+        return ""
+    return (
+        "Known-correct reference answer, obtained by running a hand-written Cypher query "
+        "directly against the graph:\n"
+        f"{reference_answer}\n\n"
+        "Judge correctness against this. The wording need not match. The agent sees at most "
+        f"{config.MAX_ROWS} rows, so naming fewer items than the reference is fine — but "
+        "contradicting it, or reporting nothing when the reference has an answer, is not.\n\n"
     )
 
 

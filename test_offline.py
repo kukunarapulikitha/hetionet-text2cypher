@@ -4,6 +4,7 @@ Run with `python test_offline.py`. No pytest and no Groq key — the LLM is neve
 called, so this costs no tokens. Needs Neo4j reachable for the execution tests.
 """
 
+import json
 import sys
 
 import metrics
@@ -213,6 +214,13 @@ def test_judge_contract() -> None:
         except Exception:
             check(f"rejects groundedness={bad}", True)
 
+    from judge import _reference_block
+
+    check("no reference means no prompt block", _reference_block(None) == "")
+    ref = _reference_block("There are 137 diseases in Hetionet.")
+    check("reference answer reaches the prompt", "137 diseases" in ref)
+    check("reference block warns about the row cap", "25 rows" in ref)
+
     check("no expectation means no prompt block", _expected_block(None) == "")
     check("an empty expectation adds nothing", _expected_block(Expectation()) == "")
     block = _expected_block(Expectation(entities=["Clonazepam"], number=137))
@@ -238,6 +246,47 @@ def test_observability_optional() -> None:
     observability.record_scores("abc", {"groundedness": 5})  # must not raise
     observability.flush()
     check("scoring and flushing are no-ops", True)
+
+
+def test_golden_dataset() -> None:
+    """The dataset is data now, so a typo in it is a silent eval change."""
+    print("\ngolden dataset")
+    import evaluate
+
+    cases = evaluate.load_cases()
+    check("loads 21 questions", len(cases) == 21, f"got {len(cases)}")
+    check("no duplicate questions", len({c.question for c in cases}) == len(cases))
+    check(
+        "every category has a rubric",
+        {c.category for c in cases} <= set(RUBRICS),
+        f"unknown: {{c.category for c in cases}} - {set(RUBRICS)}",
+    )
+    no_answer = [c for c in cases if c.category == "no-answer"]
+    check(
+        "every no-answer question expects a decline",
+        all(c.expected and c.expected.decline for c in no_answer),
+    )
+    check(
+        "no question expects both a decline and content",
+        not any(
+            c.expected and c.expected.decline and (c.expected.entities or c.expected.number)
+            for c in cases
+        ),
+    )
+    check(
+        "every question has a reference answer",
+        all(c.reference_answer for c in cases),
+        f"missing: {[c.question for c in cases if not c.reference_answer]}",
+    )
+    # An entity expectation on a question whose result set exceeds the row cap
+    # would fail at random, since the agent gets an arbitrary 25 of N rows.
+    raw = json.loads(evaluate.GOLDEN_DATASET.read_text())["questions"]
+    oversized = [
+        e["question"]
+        for e in raw
+        if (e.get("expected") or {}).get("entities") and (e.get("total_results") or 0) > 25
+    ]
+    check("no entity check on an uncapped result set", not oversized, f"unstable: {oversized}")
 
 
 def test_summary() -> None:
@@ -278,6 +327,7 @@ def main() -> int:
     test_metrics()
     test_judge_contract()
     test_observability_optional()
+    test_golden_dataset()
     test_summary()
     with HetionetGraph() as graph:
         test_execution(graph)

@@ -89,7 +89,12 @@ def record_scores(
         return
     try:
         client = _client()
+        # None means "not applicable to this question" (an un-annotated gold
+        # check, or a validity rate with no queries to divide by) — skip rather
+        # than send a null the API will reject.
         for name, value in scores.items():
+            if value is None:
+                continue
             client.create_score(
                 name=name,
                 value=value,
