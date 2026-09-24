@@ -8,6 +8,7 @@ import argparse
 import logging
 import sys
 
+import observability
 from agent import ask, build_agent
 from graph import HetionetGraph
 
@@ -51,6 +52,8 @@ def main() -> int:
 
         if args.question:
             print(ask(agent, " ".join(args.question)))
+            # Buffered spans are lost if the process exits first.
+            observability.flush()
             return 0
 
         print(BANNER, file=sys.stderr)
@@ -59,10 +62,12 @@ def main() -> int:
                 question = input("> ").strip()
             except (EOFError, KeyboardInterrupt):
                 print(file=sys.stderr)
+                observability.flush()
                 return 0
             if not question:
                 continue
             if question.lower() in {"exit", "quit"}:
+                observability.flush()
                 return 0
             try:
                 print(f"\n{ask(agent, question)}\n")

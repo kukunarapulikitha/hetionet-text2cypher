@@ -4,7 +4,8 @@ Ask a biomedical question in English. The agent reads the Neo4j schema, writes t
 Cypher, runs it against [Hetionet](https://het.io/), and answers in plain English.
 No Cypher knowledge required.
 
-Built with **LangGraph** + **ChatGroq**. Read-only by construction.
+Built with **LangGraph** + **ChatGroq**, traced with **Langfuse** and scored by an
+**LLM judge**. Read-only by construction.
 
 ```
 $ python main.py "What compounds treat epilepsy syndrome?"
@@ -40,9 +41,82 @@ python main.py                                  # interactive REPL
 python main.py "Which genes associate with Crohn's disease?"   # one-shot
 python main.py -q "How many diseases are there?"               # hide the Cypher
 python main.py --refresh-schema                 # re-introspect after a graph change
-python test_offline.py                          # 19 assertions, no Groq key needed
-python evaluate.py                              # run the 21-question eval set
+python test_offline.py                          # 60 assertions, no Groq key needed
+python evaluate.py                              # run + score the 21-question eval set
+python evaluate.py --only simple --no-judge     # cheap subset, rule-based metrics only
 ```
+
+## Architecture
+
+```mermaid
+flowchart LR
+    User(["User"])
+
+    subgraph Entry["Entry points"]
+        CLI["main.py<br/>CLI / REPL"]
+        EVAL["evaluate.py<br/>21-question eval set"]
+    end
+
+    subgraph Agent["agent.py — LCEL chain"]
+        PROMPT["ChatPromptTemplate<br/>schema + few-shot examples<br/>(examples.py)"]
+        REACT["create_react_agent<br/>ChatGroq · MAX_QUERIES budget"]
+        MEM[("InMemorySaver<br/>per-thread memory")]
+        TOOL["run_cypher @tool"]
+        STRIP["StrOutputParser<br/>+ strip &lt;think&gt;"]
+    end
+
+    subgraph Guard["Guardrails"]
+        VAL["validate.py<br/>clause blocklist<br/>procedure allowlist"]
+        GRAPH["graph.py — HetionetGraph<br/>read-only session · 10s timeout<br/>25-row cap"]
+        CACHE[(".schema_cache.json")]
+    end
+
+    NEO4J[("Neo4j — Hetionet<br/>bolt://neo4j.het.io:7687")]
+    GROQ["Groq API<br/>agent model"]
+
+    subgraph Scoring["Evaluation"]
+        METRICS["metrics.py<br/>deterministic signals<br/>gold expectations · cross_check"]
+        JUDGE["judge.py<br/>LLM judge (different model)<br/>groundedness · relevance"]
+    end
+
+    LF["Langfuse<br/>traces + scores<br/>(optional, observability.py)"]
+    CFG["config.py<br/>.env settings"]
+
+    User --> CLI
+    CLI --> PROMPT
+    EVAL --> PROMPT
+    PROMPT --> REACT
+    REACT <--> MEM
+    REACT <-->|LLM calls| GROQ
+    REACT -->|Cypher| TOOL
+    TOOL -->|rows / REJECTED / errors as text| REACT
+    TOOL --> VAL --> GRAPH --> NEO4J
+    GRAPH -. schema introspection .-> CACHE
+    CACHE -. schema .-> PROMPT
+    REACT --> STRIP -->|answer| CLI
+    STRIP --> EVAL
+    EVAL --> METRICS
+    EVAL --> JUDGE
+    JUDGE <--> GROQ
+    REACT -. callbacks .-> LF
+    METRICS -. scores .-> LF
+    JUDGE -. scores .-> LF
+    CFG -.-> Agent
+    CFG -.-> Guard
+```
+
+1. **Startup** — `graph.py` introspects the Neo4j schema (cached to `.schema_cache.json`)
+   and it is baked into the system prompt alongside the few-shot examples.
+2. **Question loop** — the ReAct agent calls ChatGroq, writes Cypher, and invokes
+   `run_cypher`. Every query passes `validate.py`, then runs in a read-only Bolt
+   session with a timeout and row cap. Rows (or errors) go back to the model, which
+   either answers or queries again, up to `MAX_QUERIES`.
+3. **Answer** — the final message is parsed, `<think>` blocks are stripped, and the
+   plain-English answer is returned to the CLI.
+4. **Evaluation** — `evaluate.py` scores each run with rule-based metrics, gold
+   expectations and an LLM judge on a separate model.
+5. **Observability** — when Langfuse keys are set, every LLM and tool call is traced
+   and eval scores are attached to the same trace; otherwise it is a no-op.
 
 ## How it works
 
@@ -119,10 +193,14 @@ before concluding the graph has no answer.
 | `graph.py` | `HetionetGraph`: schema introspection (cached to `.schema_cache.json`) + capped read-only execution. |
 | `validate.py` | Read-only enforcement. |
 | `examples.py` | 10 few-shot question → Cypher pairs. |
-| `agent.py` | The prompt template, the `run_cypher` tool, and the LCEL chain around `create_react_agent`. |
+| `agent.py` | The prompt template, the `run_cypher` tool, the LCEL chain around `create_react_agent`, and `ask_traced()`. |
 | `main.py` | CLI. Core logic is importable, so a FastAPI wrapper needs no rewrite. |
-| `evaluate.py` | 21-question eval set across 5 categories. |
-| `test_offline.py` | 19 assertions covering read-only validation, `<think>` stripping and the execution guardrails. Never calls the LLM, so it needs no Groq key and spends no tokens. |
+| `observability.py` | Langfuse tracing. Every function is a no-op when the keys are unset. |
+| `judge.py` | The LLM judge: `Judgment` schema, per-category rubrics, structured-output chain. |
+| `metrics.py` | Rule-based signals, gold `Expectation` checks, and the summary table. |
+| `golden_dataset/` | The 21 questions as data: reference Cypher, reference answer and machine-checked expectations, all verified against the live graph. |
+| `evaluate.py` | Loads the golden dataset and scores every answer three ways. |
+| `test_offline.py` | 60 assertions covering validation, `<think>` stripping, the execution guardrails, the tracing callback, the metrics and the judge schema. Never calls the LLM, so it needs no Groq key and spends no tokens. |
 
 ### Why not `langchain_neo4j.Neo4jGraph` / `GraphCypherQAChain`?
 
@@ -152,16 +230,127 @@ your own Neo4j 5.x instance and it still works — set `NEO4J_DATABASE` too.
 | Bounded agent loop — at most 5 queries per question, then a graceful message | `agent.py`, `MAX_QUERIES` |
 | No hardcoded credentials; `.env` is gitignored | `config.py`, `.gitignore` |
 
+## Observability
+
+Every run can emit a [Langfuse](https://langfuse.com) trace — the full tree of
+LLM calls and `run_cypher` invocations, with latency and token usage per step:
+
+```
+hetionet_text2cypher            4.4s   1,842 tok
+├── ChatGroq                    1.1s     612 tok
+├── run_cypher                  0.3s          MATCH (d:Disease) RETURN count(d) …
+└── ChatGroq                    0.9s     498 tok   "The graph contains 137 diseases."
+```
+
+**Tracing is entirely optional.** With `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY`
+unset, `observability.py` returns empty callback lists and nothing is sent — the
+agent behaves exactly as it did before. If the backend is unreachable it logs a
+warning and the answer still comes back; a tracing outage is not an outage.
+
+```bash
+# Free keys at https://cloud.langfuse.com, or self-host:
+# https://langfuse.com/self-hosting/docker-compose
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+```
+
+In the REPL the `thread_id` doubles as the Langfuse **session id**, so a follow-up
+conversation groups into one session and you can read the whole exchange in order.
+
 ## Evaluation
 
 `evaluate.py` runs 21 questions across five categories — simple 1-hop, multi-hop,
-aggregate, ambiguous entity naming, and questions with no answer in the graph —
-and logs each answer to `eval_results.json`.
+aggregate, ambiguous entity naming, and questions with no answer in the graph.
+It used to record the answers and leave you to read all 21 yourself. Now each one
+is scored three ways:
+
+| Evidence | Cost | What it catches |
+| --- | --- | --- |
+| **Deterministic** (`metrics.py`) | free | Did it run any Cypher? Were queries rejected? Did it burn the whole query budget, or return zero rows? |
+| **Gold expectations** (`metrics.py`) | free | A wrong query that returns *real* rows — invisible to groundedness, because the summary of those rows is perfectly faithful. |
+| **LLM judge** (`judge.py`) | ~1.5k tokens/question | Claims the rows do not support, and whether the category's rubric was met. |
 
 ```bash
-python evaluate.py                    # all 21
-python evaluate.py --only ambiguous   # one category
+python evaluate.py                          # all 21, judged
+python evaluate.py --only ambiguous         # one category
+python evaluate.py --no-judge               # rule-based metrics only, no judge tokens
+python evaluate.py --judge-only results.json  # re-score saved runs, no agent calls
 ```
+
+```
+category       n  ground   relev  expect    gold  cypher   qrys   tokens
+--------------------------------------------------------------------------
+aggregate      2    5.00    5.00    1.00    1.00    1.00   1.00     9330
+no-answer      2    3.00    5.00    0.50    0.50    1.00   1.00     8820
+```
+
+### The judge
+
+The agent's system prompt makes a checkable promise — *"Use ONLY data returned by
+the tool. Never add biomedical facts from your own knowledge"* — and nothing
+verified it. The judge does: it sees the Cypher, the rows those queries actually
+returned, and the answer, then scores **groundedness** and **relevance** 1-5 plus a
+per-category `expectation_met`, and lists every unsupported claim by name.
+
+A fact that is *true in the real world but absent from the rows* still scores 1.
+That is the point: on "Who discovered penicillin?" the model knows the answer from
+its own weights, and supplying it is the exact failure mode being tested.
+
+```
+[1/2] (no-answer) Who discovered penicillin?
+  answer   : Penicillin was discovered by Alexander Fleming in 1928 at St Marys...
+  judged   : grounded 1/5  relevant 5/5  expected NO
+  UNSUPPORTED: Alexander Fleming, 1928 at St Marys Hospital in London
+```
+
+Two things keep the judge honest. It runs on a **different model** than the agent,
+since a model grading its own output rates it generously (and Groq's token cap is
+per model, so the judge gets its own budget). And `metrics.cross_check` flags any
+answer the judge *passed* that had no rows behind it and did not decline — a
+rubber-stamp, surfaced as `SUSPECT` rather than quietly averaged in.
+
+Judgments are attached to the Langfuse trace as scores, so the table above and the
+timeline in the UI are the same data.
+
+### The golden dataset
+
+[`golden_dataset/questions.json`](golden_dataset/questions.json) is the single source of
+truth for what the agent is tested on. Every entry carries the **reference Cypher** and
+the **reference answer**, obtained by running that query against the live graph — not
+written from memory:
+
+```json
+{
+  "question": "How many diseases are in the graph?",
+  "reference_cypher": "MATCH (d:Disease) RETURN count(d) AS n",
+  "reference_answer": "There are 137 diseases in Hetionet.",
+  "expected": { "number": 137 }
+}
+```
+
+The reference answer goes into the judge prompt, and it closes the hole groundedness
+cannot see. A wrong query that returns *real* rows produces an answer that is perfectly
+faithful to those rows:
+
+```
+question  : How many diseases are in the graph?
+cypher    : MATCH (d:Disease)-[:TREATS_CtD]-(c) RETURN count(DISTINCT d)   ← wrong
+rows      : [{"n": 77}]
+answer    : The graph contains 77 diseases.
+judged    : grounded 5/5   ← correct! the answer IS faithful to the row
+            expected NO    ← caught only because the reference says 137
+```
+
+`expected` is the machine-checked part — zero tokens, no LLM. Only 10 of 21 questions
+carry one, because an expectation is only sound where the answer is stable: results are
+capped at `MAX_ROWS`, so a question whose full result set exceeds the cap returns an
+arbitrary 25 of *N* rows, and naming entities there would fail at random rather than on a
+regression. `epilepsy syndrome` has exactly 25 treating compounds and the aggregates are
+ordered, so those qualify; Crohn's disease (120 genes) does not. An offline test enforces
+this rule so the dataset can't drift into flakiness.
+
+Every `no-answer` question carries `{"decline": true}` instead — a regex check that the
+answer actually reports finding nothing.
 
 One eval question is *mis-categorised* by intent, not by accident: "What drugs
 treat heart attack?" sits under `no-answer` rather than `ambiguous`, because
@@ -184,10 +373,10 @@ disease`. Translating the term and then reporting no results is correct here.
   category, or switch `GROQ_MODEL` to get a fresh budget:
 
   ```bash
-  GROQ_MODEL=qwen/qwen3.6-27b python main.py "What treats hypertension?"
+  GROQ_MODEL=qwen/qwen3.8-27b python main.py "What treats hypertension?"
   ```
 
-  Reasoning models such as `qwen/qwen3.6-27b` wrap their chain of thought in
+  Reasoning models such as `qwen/qwen3.8-27b` wrap their chain of thought in
   `<think>` tags; `_strip_reasoning()` removes it so only the answer is printed.
 
 ## The Hetionet schema

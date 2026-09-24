@@ -20,7 +20,10 @@ rejected or empty query is something it can recover from on the next turn.
 import json
 import logging
 import re
+import time
+from dataclasses import asdict, dataclass, field
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable, RunnableLambda
@@ -31,6 +34,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.prebuilt import create_react_agent
 
 import config
+import observability
 from examples import format_examples
 from graph import HetionetGraph
 from validate import UnsafeQueryError, validate
@@ -215,4 +219,101 @@ def ask(agent: Runnable, question: str, thread_id: str = "default") -> str:
 
     Questions sharing a thread_id share history; a new thread_id starts fresh.
     """
-    return agent.invoke(question, {"configurable": {"thread_id": thread_id}})
+    return agent.invoke(question, _run_config(thread_id))
+
+
+def _run_config(
+    thread_id: str,
+    trace_id: str | None = None,
+    extra_callbacks: list | None = None,
+    tags: list[str] | None = None,
+) -> dict:
+    """Thread id, Langfuse callbacks and trace metadata in one runnable config.
+
+    With tracing off, callbacks and metadata are empty and this is exactly the
+    config the agent has always been invoked with.
+    """
+    return {
+        "configurable": {"thread_id": thread_id},
+        "callbacks": [*observability.callbacks(trace_id), *(extra_callbacks or [])],
+        "metadata": observability.metadata(session_id=thread_id, tags=tags),
+    }
+
+
+# --- Traced runs, for evaluation -----------------------------------------
+@dataclass(slots=True)
+class AgentRun:
+    """Everything one question produced, not just its final answer.
+
+    An LLM judge cannot score groundedness from the answer alone — it needs the
+    Cypher the agent ran and the rows that came back, which the LCEL chain
+    discards when it takes ``state["messages"][-1]``.
+    """
+
+    question: str
+    answer: str = ""
+    queries: list[str] = field(default_factory=list)
+    results: list[str] = field(default_factory=list)  # index-aligned with queries
+    tokens: int = 0
+    latency_s: float = 0.0
+    graceful_failure: bool = False
+    trace_id: str | None = None
+    error: str | None = None
+
+    @property
+    def query_count(self) -> int:
+        return len(self.queries)
+
+    def to_dict(self) -> dict:
+        return asdict(self) | {"query_count": self.query_count}
+
+
+class _CypherTrace(BaseCallbackHandler):
+    """Records tool calls and token usage as the graph runs.
+
+    A callback rather than a read of the final state, because it fires *during*
+    the run: when the agent overruns MAX_QUERIES the GraphRecursionError
+    destroys the state before the fallback returns GRACEFUL_FAILURE, and the
+    overrun is precisely the case worth inspecting.
+    """
+
+    def __init__(self) -> None:
+        self.queries: list[str] = []
+        self.results: list[str] = []
+        self.tokens = 0
+
+    def on_tool_start(self, serialized, input_str, **kwargs) -> None:
+        inputs = kwargs.get("inputs") or {}
+        self.queries.append(inputs.get("cypher") or input_str or "")
+
+    def on_tool_end(self, output, **kwargs) -> None:
+        self.results.append(str(getattr(output, "content", output)))
+
+    def on_llm_end(self, response, **kwargs) -> None:
+        usage = (response.llm_output or {}).get("token_usage") or {}
+        self.tokens += usage.get("total_tokens") or 0
+
+
+def ask_traced(agent: Runnable, question: str, thread_id: str = "default") -> AgentRun:
+    """Run one question and return the full record of what happened.
+
+    Invokes the same Runnable ``ask()`` does, so the thing being evaluated is
+    the thing that ships.
+    """
+    trace = _CypherTrace()
+    trace_id = observability.new_trace_id()
+    run = AgentRun(question=question, trace_id=trace_id)
+    started = time.perf_counter()
+    try:
+        run.answer = agent.invoke(
+            question,
+            _run_config(thread_id, trace_id, extra_callbacks=[trace], tags=["eval"]),
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded so the eval keeps going
+        run.error = f"{type(exc).__name__}: {exc}"
+    run.latency_s = round(time.perf_counter() - started, 2)
+
+    # Read off the callback, so a run that crashed still reports its queries.
+    run.queries, run.results, run.tokens = trace.queries, trace.results, trace.tokens
+    run.graceful_failure = run.answer == GRACEFUL_FAILURE
+    return run
